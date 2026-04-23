@@ -1,3 +1,14 @@
+"""
+URL enrichment via DuckDuckGo HTML scraping.
+
+Design for anti-bot resilience:
+- Fresh requests.Session per lookup (no cookie accumulation across queries)
+- Rotating User-Agent pool (avoids fingerprinting)
+- Strictly sequential processing (no concurrent bursts)
+- Exponential backoff on failures
+- Jittered delays between requests to look human
+"""
+
 import asyncio
 import logging
 import random
@@ -13,6 +24,7 @@ app = FastAPI()
 _logger = logging.getLogger(__name__)
 
 
+# ── User-Agent rotation pool ─────────────────────────────────────────────────
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -45,17 +57,22 @@ def _make_session() -> requests.Session:
 
 
 def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
-   
+    """Fetch a property URL from DuckDuckGo HTML search.
+
+    Uses a FRESH session per call (no cookie accumulation).
+    Retries up to 3 times with exponential backoff.
+    """
     query = f"{address.strip()} {source.strip()}"
     url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
     target = source.lower().replace(" ", "").replace(".com", "").replace("www.", "")
 
     for attempt in range(3):
-        sess = _make_session() 
+        sess = _make_session()  # fresh session every attempt
         try:
             res = sess.get(url, timeout=15)
 
             if res.status_code in (202, 403):
+                # DDG rate-limiting or blocking — back off hard
                 wait = random.uniform(5.0 * (attempt + 1), 10.0 * (attempt + 1))
                 _logger.warning(
                     "DDG returned %s for '%s' (attempt %d), backing off %.1fs",
@@ -73,6 +90,7 @@ def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
             results = soup.select("a.result__a")
 
             if not results:
+                # Could be a CAPTCHA page or empty results
                 _logger.debug("No DDG results for '%s' (attempt %d)", address, attempt + 1)
                 time.sleep(random.uniform(3.0, 6.0))
                 continue
@@ -93,6 +111,7 @@ def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
                 if target in domain:
                     return actual_url
 
+            # Results found but no source match — don't retry
             _logger.debug("DDG results found but no '%s' match for '%s'", source, address)
             return None
 
@@ -103,13 +122,19 @@ def _ddg_fetch_url_for_property(address: str, source: str) -> str | None:
             _logger.warning("DDG error for '%s' (attempt %d): %s", address, attempt + 1, e)
             time.sleep(random.uniform(2.0, 5.0))
         finally:
-            sess.close()  
+            sess.close()  # ensure connection is fully closed
 
     return None
 
 
 async def _run_enrich(data: dict) -> dict:
-    """Core enrich logic — strictly sequential, human-like delays between lookups."""
+    """Core enrich logic — sequential with human-like delays.
+
+    Delay kept at 3-8s per item so total stays well under
+    Render's 30s request timeout for typical batch sizes.
+    Anti-bot protection comes from fresh sessions + UA rotation,
+    not from long delays.
+    """
     items = data.get("clean_sold_comps", []) + data.get("clean_active_listings", [])
 
     results = []
@@ -121,8 +146,9 @@ async def _run_enrich(data: dict) -> dict:
             results.append({**item, "url": None})
             continue
 
+        # ✅ 3-8s delay — human-like but safe within Render's timeout
         if i > 0:
-            delay = random.uniform(12.0, 35.0)
+            delay = random.uniform(3.0, 8.0)
             _logger.debug("Sleeping %.1fs before next lookup", delay)
             await asyncio.sleep(delay)
 
